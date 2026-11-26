@@ -1605,6 +1605,7 @@ export default {
         not_loaded: 'Not loaded',
         loading: 'Loading',
         ready: 'Ready',
+        stale: 'Tool directory needs a refresh',
         needs_auth: 'Authorization required',
         error: 'Connection failed',
         disabled: 'Disabled',

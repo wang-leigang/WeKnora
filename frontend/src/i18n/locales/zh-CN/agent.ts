@@ -1099,6 +1099,7 @@ export default {
         not_loaded: '未加载',
         loading: '加载中',
         ready: '可用',
+        stale: '工具目录需刷新',
         needs_auth: '需要授权',
         error: '连接失败',
         disabled: '已禁用',

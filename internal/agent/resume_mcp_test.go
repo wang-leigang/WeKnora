@@ -9,6 +9,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/agent/policy"
 	"github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/event"
+	"github.com/Tencent/WeKnora/internal/mcp"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/require"
 )
@@ -80,7 +81,7 @@ func TestResumeRestoresFirstDeferredMCPCall(t *testing.T) {
 				args = string(data)
 			}
 			snap := RunSnapshot{
-				MCPToolRefs: original.MCPExposureSnapshot(),
+				MCPRunState: original.MCPRunState(),
 				Version:     RunSnapshotVersion, Query: "do the work",
 				PendingRound: PendingRound{Calls: []PendingCall{{ID: "call", Name: name, Arguments: args}}},
 			}
@@ -101,4 +102,65 @@ func TestResumeRestoresFirstDeferredMCPCall(t *testing.T) {
 			require.True(t, gate.resumed, "must find the deferred tool and deliver the existing decision")
 		})
 	}
+}
+
+func TestMCPRefreshFailureSurvivesRepeatedApproval(t *testing.T) {
+	ctx := types.WithPrincipal(context.WithValue(t.Context(), types.TenantIDContextKey, uint64(1)),
+		types.Principal{Type: types.PrincipalWebUser, ID: "employee"})
+	manager := mcp.NewMCPManager(nil)
+	t.Cleanup(manager.Shutdown)
+	// A missing endpoint fails a live refresh without contacting any remote server.
+	service := &types.MCPService{
+		ID: "orders", Name: "Orders", Enabled: true, TransportType: types.MCPTransportHTTPStreamable,
+	}
+	newEngine := func() *suspendFixture {
+		f := newSuspendFixture(t, "first", false)
+		_, err := tools.RegisterMCPTools(ctx, f.engine.toolRegistry, []*types.MCPService{service}, manager, nil, 0, nil,
+			&tools.MCPMetadataIO{Get: func(context.Context, uint64, string) (*types.MCPMetadata, error) {
+				return &types.MCPMetadata{Stale: true}, nil
+			}})
+		require.NoError(t, err)
+		f.engine.toolRegistry.PrepareMCPTools(ctx)
+		f.engine.EnableSuspension(nil)
+		return f
+	}
+	first := newEngine()
+	calls := first.engine.chatModel.(*mockChat).responses[0].chunks[0].ToolCalls
+	calls[0].Function = types.FunctionCall{
+		Name:      tools.ToolDiscoverMCPTools,
+		Arguments: `{"mode":"list_tools","server_id":"ms1","refresh":true}`,
+	}
+	calls[2].Function.Name = suspendingToolName
+	state, err := first.engine.Execute(ctx, "s", "m", "check orders", nil)
+	require.NoError(t, err)
+	require.NotNil(t, state.Suspended)
+	require.NoError(t, first.blocked.err)
+	require.Contains(t, state.SuspendedStep.ToolCalls[0].Result.Error, "refresh failed")
+
+	second := newEngine()
+	state, err = second.engine.Resume(ctx, "s", "m", nil, first.blocked.snapshot, answeredPrompt("call-b"))
+	require.NoError(t, err)
+	require.NotNil(t, state.Suspended)
+	require.NoError(t, second.blocked.err)
+
+	third := newEngine()
+	model := collaborationAnswerModel("done")
+	third.engine.chatModel = model
+	state, err = third.engine.Resume(ctx, "s", "m", nil, second.blocked.snapshot, answeredPrompt("call-c"))
+	require.NoError(t, err)
+	require.True(t, state.IsComplete)
+	require.Len(t, model.opts, 1)
+	for _, definition := range model.opts[0].Tools {
+		if definition.Function.Name == tools.ToolDiscoverMCPTools {
+			require.Contains(t, definition.Function.Description, `"status":"error"`)
+			require.Contains(t, definition.Function.Description, `"last_refresh_error"`)
+			result, err := third.engine.toolRegistry.ExecuteTool(ctx, tools.ToolDiscoverMCPTools,
+				json.RawMessage(`{"mode":"list_tools","server_id":"orders"}`))
+			require.NoError(t, err)
+			require.Equal(t, "error", result.Data["status"])
+			require.NotContains(t, result.Error, "refresh=true")
+			return
+		}
+	}
+	t.Fatal("missing MCP directory in resumed model request")
 }

@@ -417,7 +417,7 @@ Agent 启动时由 `internal/application/service/agent_service.go` 按 Agent 配
 
 生产默认使用持久目录与按需加载。没有历史工具需要恢复时，起始只向模型提供 `discover_mcp_tools` 和已授权服务的来源摘要；取得可用的完整定义后才同时暴露对应函数与 `call_mcp_tool`。不会把所有上游 schema 一次性发送给模型。
 
-1. `PrepareMCPTools` 预读持久快照，不为预加载建立上游连接；缺少或过时目录会显示相应状态。运行期的目录补齐仍受权限与 OAuth 主体约束。
+1. `PrepareMCPTools` 预读持久快照。静态认证服务尚无目录时显示 `not_loaded`，模型首次查询该服务的工具时才连接上游。连接配置已变化的目录显示 `stale`。仍适用的快照超过最长保存时间时，按下文的规则在后台重新拉取。运行期的目录补齐仍受权限与 OAuth 主体约束。
 2. 模型通过 `list_tools` / `search` 定位，再 `describe` 获取完整工具定义与 `tool_ref`。列表摘要不能直接当作调用定义。
 3. 已 describe 的工具在下一次模型请求前发布为普通函数；新 engine 可从会话历史恢复已用工具，也可经 `call_mcp_tool` 代理调用。
 4. 执行时重新检查服务、主体、工具策略与参数 schema，再进入审批/OAuth/远端调用链。目录缓存不缓存权限决策。
@@ -445,7 +445,7 @@ Mention 只是优先选择，不改变 Agent 的 `all / selected / none` 范围�
 
 `GET /mcp-services/:id/metadata` 只读缓存，未同步时 `data:null`；`POST /mcp-services/:id/metadata/refresh` 显式连接上游同步。静态认证刷新需要 Admin 或对应管理能力，OAuth 用户可刷新自己的授权目录。接口前缀为 `/api/v1`，见[MCP API](../04-api/02-api-agent-mcp.md)。
 
-运行时 `list_tools(refresh=true)` 会重新拉取上游并尝试保存当前主体快照，不只是重读数据库。刷新有超时和目录大小限制，失败保留错误状态；不能把缓存成功解释为当前上游一定可达。升级前没有完整目录的服务，需要首次同步。
+目录过期时，服务摘要显示 `stale`。当前任务需要该 MCP 时，Agent 可调用 `list_tools(refresh=true)` 拉取上游目录并尝试保存当前主体快照。若刷新失败，同一轮再次读到同一配置的过期目录时，会保留最近的刷新失败原因。若上次刷新超时，调整连接超时后，再次查看过期目录会重新提示可按需刷新。刷新有超时和目录大小限制。缓存读取成功只表示已有目录可用。升级前没有完整目录的服务，需要首次同步。
 
 服务端重新部署后，已保存的目录还会在以下情况下自动按当前主体重新拉取，无需管理员逐一刷新（OAuth 目录按用户保存，管理员本来也无法代为刷新）：
 

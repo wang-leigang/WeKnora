@@ -20,6 +20,10 @@ const (
 	mcpCatalogLoadTimeout = 30 * time.Second
 )
 
+// Deferred startup reads saved directories; the first runtime discovery can
+// fill a missing one. Full-exposure startup still needs the live definitions.
+type mcpDeferredPreloadKey struct{}
+
 // MCPRegisteredTool is a model-visible definition bound to one authorized
 // catalog and schema. It must not bypass the directory's live permission and
 // configuration checks just because its definition was advertised up front.
@@ -98,7 +102,8 @@ func (r *ToolRegistry) mcpCatalog() *MCPCatalog {
 
 // PrepareMCPTools advertises sources up front, loading full functions only after
 // describe. This is application-level deferred loading via ordinary functions.
-// Production readers use persisted metadata and perform no upstream discovery.
+// Missing persisted metadata is filled on demand. Age-based revalidation of
+// an existing snapshot may still run in the background.
 func (r *ToolRegistry) PrepareMCPTools(ctx context.Context) {
 	r.prepareMCPToolsWithMode(ctx, mcpStartupGrace, false)
 }
@@ -128,10 +133,11 @@ func (r *ToolRegistry) prepareMCPToolsWithMode(ctx context.Context, grace time.D
 			// fan-out below must not skip the close; the barrier also records
 			// every service this pass left unfinished.
 			defer RecoverGoroutine(ctx, "MCP catalog preload", func() { c.markPreloadFailed() })
-			loadCtx, cancel := context.WithTimeout(
-				context.WithValue(ctx, execCtxKey{}, (*ToolExecContext)(nil)),
-				mcpCatalogLoadTimeout,
-			)
+			preloadCtx := context.WithValue(ctx, execCtxKey{}, (*ToolExecContext)(nil))
+			if !direct {
+				preloadCtx = context.WithValue(preloadCtx, mcpDeferredPreloadKey{}, true)
+			}
+			loadCtx, cancel := context.WithTimeout(preloadCtx, mcpCatalogLoadTimeout)
 			defer cancel()
 			var workers sync.WaitGroup
 			// No ToolExecContext is installed during engine preparation, so this
@@ -298,39 +304,74 @@ func (r *ToolRegistry) RefreshMCPTools(ctx context.Context) {
 	}
 }
 
-// MCPExposureSnapshot preserves definitions that were described but have not
-// been called yet. Call history alone cannot restore this deferred tool state.
-// References contain a schema hash; no credentials or remote definitions are saved.
-func (r *ToolRegistry) MCPExposureSnapshot() []string {
+// MCPRunState holds the directory knowledge unique to one suspended turn.
+// Tool definitions and service configurations are reloaded by the new engine.
+type MCPRunState struct {
+	ToolRefs        []string                     `json:"mcp_tool_refs,omitempty"`
+	RefreshFailures map[string]mcpRefreshFailure `json:"mcp_refresh_failures,omitempty"`
+}
+
+type mcpRefreshFailure struct {
+	Kind    mcpRefreshFailureKind `json:"kind"`
+	Binding string                `json:"binding"`
+}
+
+// A failure only applies to the same authorized connection. Timeout failures
+// also depend on the configured deadline. Persist the digest, never credentials.
+func (c *MCPCatalog) refreshFailureBinding(service *types.MCPService, kind mcpRefreshFailureKind) string {
+	var timeout time.Duration
+	if kind == mcpRefreshFailureTimeout {
+		timeout = service.ConnectionTimeout()
+	}
+	raw, _ := json.Marshal([]any{
+		c.tenantID, c.principal, c.oauthPrincipal, service.ID,
+		types.MCPConfigFingerprint(service), timeout,
+	})
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+// MCPRunState captures tool references and refresh failures for this turn.
+func (r *ToolRegistry) MCPRunState() (state MCPRunState) {
 	if r == nil {
-		return nil
+		return state
 	}
 	c := r.mcpCatalog()
 	if c == nil {
-		return nil
+		return state
 	}
-	refs := []string{}
 	c.described.Range(func(key, _ any) bool {
 		if ref, ok := key.(string); ok {
-			refs = append(refs, ref)
+			state.ToolRefs = append(state.ToolRefs, ref)
 		}
 		return true
 	})
-	sort.Strings(refs)
-	return refs
+	sort.Strings(state.ToolRefs)
+	for id, entry := range c.servers {
+		entry.mu.Lock()
+		service, kind := entry.service, entry.directory.lastRefreshFailure
+		entry.mu.Unlock()
+		if kind != mcpRefreshFailureNone {
+			if state.RefreshFailures == nil {
+				state.RefreshFailures = make(map[string]mcpRefreshFailure)
+			}
+			state.RefreshFailures[id] = mcpRefreshFailure{Kind: kind, Binding: c.refreshFailureBinding(service, kind)}
+		}
+	}
+	return state
 }
 
-// RestoreMCPExposure restores exposure only. Refresh and execution still check
-// the current principal, enabled policy, service configuration and schema hash.
-func (r *ToolRegistry) RestoreMCPExposure(refs []string) {
+// RestoreMCPRunState does not restore access or directory readiness. A fresh
+// directory supersedes a failed refresh, even if a startup read finishes later.
+func (r *ToolRegistry) RestoreMCPRunState(ctx context.Context, state MCPRunState) {
 	if r == nil {
 		return
 	}
 	c := r.mcpCatalog()
-	if c == nil {
+	if c == nil || c.authorize(ctx) != nil {
 		return
 	}
-	for _, ref := range refs {
+	for _, ref := range state.ToolRefs {
 		if len(ref) != len("mcpt_")+sha256.Size*2 || !strings.HasPrefix(ref, "mcpt_") {
 			continue
 		}
@@ -338,5 +379,21 @@ func (r *ToolRegistry) RestoreMCPExposure(refs []string) {
 			continue
 		}
 		c.historyRefs.Store(ref, true)
+	}
+	for id, failure := range state.RefreshFailures {
+		entry := c.servers[id]
+		status, _ := failure.Kind.feedback()
+		if entry == nil || status == "" {
+			continue
+		}
+		entry.mu.Lock()
+		if entry.status != "ready" && entry.status != "disabled" &&
+			c.refreshFailureBinding(entry.service, failure.Kind) == failure.Binding {
+			entry.directory.lastRefreshFailure = failure.Kind
+			if entry.status == "stale" {
+				entry.status = status
+			}
+		}
+		entry.mu.Unlock()
 	}
 }

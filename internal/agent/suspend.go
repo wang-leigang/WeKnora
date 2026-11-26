@@ -34,10 +34,10 @@ type CollaborationDelivery struct {
 type RunSnapshot struct {
 	CollaborationDeliveries []CollaborationDelivery `json:"collaboration_deliveries,omitempty"`
 	CollaborationCursor     *int64                  `json:"collaboration_cursor,omitempty"`
-	MCPToolRefs             []string                `json:"mcp_tool_refs,omitempty"`
-	Version                 int                     `json:"version"`
-	CollaborationWait       bool                    `json:"collaboration_wait,omitempty"`
-	BetweenRounds           bool                    `json:"between_rounds,omitempty"`
+	agenttools.MCPRunState
+	Version           int  `json:"version"`
+	CollaborationWait bool `json:"collaboration_wait,omitempty"`
+	BetweenRounds     bool `json:"between_rounds,omitempty"`
 	// Request is the caller's types.ResumableAgentRequest.
 	Request   json.RawMessage `json:"request,omitempty"`
 	Query     string          `json:"query"`
@@ -277,7 +277,7 @@ func (e *AgentEngine) snapshot(blocked int) (*RunSnapshot, error) {
 		CollaborationDeliveries: append([]CollaborationDelivery(nil), p.collaborationDeliveries...),
 		CollaborationCursor:     e.collaborationCursor(),
 		Version:                 RunSnapshotVersion,
-		MCPToolRefs:             e.toolRegistry.MCPExposureSnapshot(),
+		MCPRunState:             e.toolRegistry.MCPRunState(),
 		Request:                 e.suspendRequest,
 		Query:                   p.query,
 		ImageURLs:               p.imageURLs,

@@ -712,7 +712,7 @@ func loadMCPDirectory(
 			return nil, err
 		}
 		if snapshot != nil && snapshot.Stale {
-			return nil, fmt.Errorf("MCP directory is stale; refresh Tools in Settings > MCP management")
+			return nil, errMCPDirectoryStale
 		}
 		if snapshot != nil {
 			return &mcpDirectory{
@@ -732,6 +732,8 @@ func loadMCPDirectory(
 		if _, ok := ToolExecFromContext(loadCtx); !ok {
 			return nil, fmt.Errorf("MCP directory is missing; authorize this service, then refresh Tools")
 		}
+	} else if !live && loadCtx.Value(mcpDeferredPreloadKey{}) == true {
+		return nil, errMCPDirectoryNotLoaded
 	}
 	listedAt := time.Now()
 	directory, err := loadMCPServiceTools(loadCtx, service, mcpManager, gate, oauthSess)

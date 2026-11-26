@@ -635,3 +635,25 @@ func TestFailedReloadAfterRelistKeepsTheWorkingTools(t *testing.T) {
 	defer catalog.servers["svc"].mu.Unlock()
 	require.False(t, catalog.servers["svc"].reload, "the reload is retried until it succeeds")
 }
+
+func TestReloadAfterRelistRetiresToolsFromStaleDirectory(t *testing.T) {
+	service := &types.MCPService{ID: "svc", Name: "Orders", Enabled: true}
+	store := &memoryDirectoryStore{}
+	store.save(savedDirectory("1", "guidance", time.Now(), "get_order"))
+	catalog, _ := engineCatalog(t, service, store, nil)
+	previous := catalogTool(t, catalog, "get_order")
+	direct := &MCPRegisteredTool{MCPTool: previous, catalog: catalog, ref: mcpToolRef(previous)}
+
+	snapshot, _ := store.current()
+	snapshot.Stale = true
+	store.save(&snapshot)
+	catalog.markForReload(service.ID)
+
+	result, err := direct.Execute(catalogTestContext(), json.RawMessage(`{}`))
+	require.NoError(t, err)
+	require.False(t, result.Success)
+	require.Equal(t, "stale", result.Data["status"])
+	require.Contains(t, result.Error, "refresh=true")
+	require.Equal(t, "stale", catalog.servers[service.ID].summary(service.ID).Status)
+	require.Nil(t, catalog.cachedTool(direct.ref))
+}

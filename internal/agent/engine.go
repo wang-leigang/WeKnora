@@ -1277,7 +1277,7 @@ func (e *AgentEngine) runReActIteration(
 				checkpoint := RunSnapshot{
 					CollaborationDeliveries: e.progress.collaborationDeliveries,
 					CollaborationCursor:     e.collaborationCursor(),
-					MCPToolRefs:             e.toolRegistry.MCPExposureSnapshot(),
+					MCPRunState:             e.toolRegistry.MCPRunState(),
 					Version:                 RunSnapshotVersion,
 					CollaborationWait:       true,
 					BetweenRounds:           true,

@@ -3,8 +3,10 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
+	"github.com/mark3labs/mcp-go/client/transport"
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	sdkserver "github.com/mark3labs/mcp-go/server"
 	"github.com/stretchr/testify/require"
@@ -80,6 +83,40 @@ func (g oauthRetryTestGate) RequestOAuthAndWait(
 ) (approval.Decision, error) {
 	g.authorized()
 	return approval.Decision{Approved: true}, nil
+}
+
+func TestMCPOAuthPromptRequiresAnAuthorizationError(t *testing.T) {
+	const endpoint = "https://example.com/warehouse-401/mcp"
+	tests := []struct {
+		name   string
+		err    error
+		prompt bool
+	}{
+		{"http_401", &transport.AuthorizationRequiredError{}, true},
+		{"oauth_401", &transport.OAuthAuthorizationRequiredError{}, true},
+		{"missing_sdk_token", transport.ErrOAuthAuthorizationRequired, true},
+		{"unauthorized_sentinel", transport.ErrUnauthorized, true},
+		{"needs_new_consent", &mcp.OAuthReauthorizationRequiredError{}, true},
+		{"http_timeout", &url.Error{Op: "Post", URL: endpoint, Err: context.DeadlineExceeded}, false},
+		{"connection_refused", &url.Error{Op: "Post", URL: endpoint, Err: errors.New("connection refused")}, false},
+		{"service_unavailable", errors.New("request failed with status 503: authorization required (401)"), false},
+		{"temporary_refresh", &mcp.OAuthRefreshTemporaryError{Err: errors.New("no valid token response")}, false},
+	}
+	ctx := catalogTestContext()
+	sess := &MCPOAuthSession{EventBus: event.NewEventBus()}
+	service := &types.MCPService{AuthConfig: &types.MCPAuthConfig{AuthType: types.MCPAuthOAuth}}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			prompted := false
+			gate := oauthRetryTestGate{authorized: func() { prompted = true }}
+			_, cancel, retry := waitForMCPOAuthAuthorization(
+				ctx, gate, sess, service, "", "discovery", fmt.Errorf("connect: %w", test.err),
+			)
+			defer cancel()
+			require.Equal(t, test.prompt, prompted)
+			require.Equal(t, test.prompt, retry)
+		})
+	}
 }
 
 // approvedOAuthGate requires approval for every call, approves it, and then

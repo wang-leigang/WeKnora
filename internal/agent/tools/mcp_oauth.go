@@ -4,14 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/agent/approval"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/mcp"
 	"github.com/Tencent/WeKnora/internal/types"
-	mcpclient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
 )
 
 const defaultMCPToolExecTimeout = 60 * time.Second
@@ -248,18 +247,9 @@ func oauthAwareConnectError(service *types.MCPService, err error) string {
 }
 
 func isAuthorizationRequired(err error) bool {
-	if err == nil {
-		return false
-	}
-	if mcpclient.IsOAuthAuthorizationRequiredError(err) || mcpclient.IsAuthorizationRequiredError(err) {
-		return true
-	}
+	// HTTP and SSE auth errors unwrap to SDK sentinels. Other transport
+	// errors can quote request URLs and response bodies containing "401".
 	var reauth *mcp.OAuthReauthorizationRequiredError
-	if errors.As(err, &reauth) {
-		return true
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "authorization required") ||
-		strings.Contains(msg, "no valid token") ||
-		strings.Contains(msg, "401")
+	return errors.As(err, &reauth) || errors.Is(err, transport.ErrAuthorizationRequired) ||
+		errors.Is(err, transport.ErrOAuthAuthorizationRequired) || errors.Is(err, transport.ErrUnauthorized)
 }

@@ -1099,6 +1099,7 @@ export default {
         not_loaded: '로드되지 않음',
         loading: '로드 중',
         ready: '사용 가능',
+        stale: '도구 목록 갱신 필요',
         needs_auth: '인증 필요',
         error: '연결 실패',
         disabled: '비활성화됨',

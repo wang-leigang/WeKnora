@@ -57,6 +57,20 @@ test('operation labels remain referenced when pruning locale bundles', () => {
   assert.deepEqual(keys.filter((key) => !referencedKeys.has(key)), [])
 })
 
+test('locale regeneration preserves MCP directory status labels in every language', () => {
+  const locales = Object.keys(LOCALE_BUNDLES) as LocaleName[]
+  const bundles = {} as Record<LocaleName, Record<string, unknown>>
+  for (const locale of locales) {
+    bundles[locale] = { agentStream: { mcp: LOCALE_BUNDLES[locale].agentStream.mcp } }
+  }
+  const rebuilt = rebuildPrunedLocales(bundles)
+  for (const locale of locales) {
+    const labels = LOCALE_BUNDLES[locale].agentStream.mcp.status
+    assert.ok(labels.stale, `${locale}: missing stale label`)
+    assert.deepEqual(getLocaleValueAtPath(rebuilt[locale], 'agentStream.mcp.status'), labels, locale)
+  }
+})
+
 test('installer command progress messages resolve in the settings namespace', () => {
   for (const [locale, bundle] of Object.entries(LOCALE_BUNDLES)) {
     for (const name of ['installCommandRunning', 'installCommandWaiting']) {

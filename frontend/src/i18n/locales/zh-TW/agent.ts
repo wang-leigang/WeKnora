@@ -1099,6 +1099,7 @@ export default {
         not_loaded: '未載入',
         loading: '載入中',
         ready: '可用',
+        stale: '工具目錄需重新整理',
         needs_auth: '需要授權',
         error: '連結失敗',
         disabled: '已停用',

@@ -13,6 +13,8 @@ import (
 	"github.com/Tencent/WeKnora/internal/agent/approval"
 	"github.com/Tencent/WeKnora/internal/agent/policy"
 	"github.com/Tencent/WeKnora/internal/event"
+	"github.com/Tencent/WeKnora/internal/mcp"
+	"github.com/Tencent/WeKnora/internal/modelcontext"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/require"
 )
@@ -421,8 +423,12 @@ func TestMCPCatalogRefreshRetiresRemovedAndChangedDefinitions(t *testing.T) {
 	result, err := r.ExecuteTool(ctx, ToolCallMCPTool, raw)
 	require.NoError(t, err)
 	require.False(t, result.Success)
-	c.load = func(context.Context, *types.MCPService, bool) ([]*MCPTool, error) {
-		return nil, errors.New("token=private")
+	readDirectory := c.load
+	c.load = func(ctx context.Context, service *types.MCPService, live bool) ([]*MCPTool, error) {
+		if live {
+			return nil, errors.New("token=private")
+		}
+		return readDirectory(ctx, service, false)
 	}
 	result, err = r.ExecuteTool(ctx, ToolDiscoverMCPTools, json.RawMessage(`{
   "mode": "list_tools",
@@ -433,7 +439,152 @@ func TestMCPCatalogRefreshRetiresRemovedAndChangedDefinitions(t *testing.T) {
 	require.False(t, result.Success)
 	require.Equal(t, "error", result.Data["status"])
 	require.NotContains(t, result.Error, "private")
+	require.NotContains(t, result.Error, "still needs a refresh")
 	require.Empty(t, c.servers["server-1"].tools)
+	row := discoverPage(ctx, t, r, map[string]any{"mode": "list_servers"}).Servers[0]
+	require.Contains(t, row.LastRefreshError, "refresh failed")
+	require.NotContains(t, row.LastRefreshError, "still needs a refresh")
+
+	page := discoverPage(ctx, t, r, map[string]any{"mode": "list_tools", "server_id": "server-1"})
+	require.Equal(t, "ready", page.Status)
+	row = discoverPage(ctx, t, r, map[string]any{"mode": "list_servers"}).Servers[0]
+	require.Empty(t, row.LastRefreshError)
+}
+
+func TestMCPCatalogReportsFailedStaleDirectoryRefresh(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cause  error
+		status string
+		reason string
+	}{
+		{"timeout", context.DeadlineExceeded, "error", "timed out"},
+		{"authorization", &mcp.OAuthReauthorizationRequiredError{}, "needs_auth", "Authorization"},
+		{"connection", errors.New("connection refused"), "error", "refresh failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, registry, catalog, _, _ := catalogFixture(t, 1)
+			load := catalog.load
+			stale := false
+			refreshErr := fmt.Errorf("private-diagnostic: %w", tc.cause)
+			catalog.load = func(ctx context.Context, service *types.MCPService, live bool) ([]*MCPTool, error) {
+				if service.ID != "server-1" {
+					return nil, nil
+				}
+				if live && refreshErr != nil {
+					return nil, refreshErr
+				}
+				if !live && stale {
+					return nil, errMCPDirectoryStale
+				}
+				stale = false
+				return load(ctx, service, live)
+			}
+			registry.PrepareMCPToolsDirect(ctx)
+			direct := MCPToolNamesByServiceID(registry)["server-1"]
+			require.Len(t, direct, 1)
+			stale = true
+			catalog.markForReload("server-1")
+			list := json.RawMessage(`{"mode":"list_tools","server_id":"server-1"}`)
+			refresh := json.RawMessage(`{"mode":"list_tools","server_id":"server-1","refresh":true}`)
+			result, err := registry.ExecuteTool(ctx, ToolDiscoverMCPTools, list)
+			require.NoError(t, err)
+			require.False(t, result.Success)
+			require.Equal(t, "stale", result.Data["status"])
+
+			checkReason := func(visible string) {
+				t.Helper()
+				require.Contains(t, strings.ToLower(visible), strings.ToLower(tc.reason))
+				require.NotContains(t, visible, "private-diagnostic")
+				require.NotContains(t, visible, "refresh=true")
+			}
+			for _, args := range []json.RawMessage{refresh, list} {
+				result, err = registry.ExecuteTool(ctx, ToolDiscoverMCPTools, args)
+				require.NoError(t, err)
+				require.False(t, result.Success)
+				require.Equal(t, tc.status, result.Data["status"])
+				visible := modelcontext.NewRegistry(true).ModelToolResultForTool(ToolDiscoverMCPTools, result)
+				require.Contains(t, visible, "still needs a refresh")
+				checkReason(visible)
+			}
+
+			page := discoverPage(ctx, t, registry, map[string]any{"mode": "list_servers"})
+			require.NotEmpty(t, page.Servers)
+			row := page.Servers[0]
+			require.Equal(t, "server-1", row.ServerID)
+			require.Equal(t, tc.status, row.Status)
+			encoded, err := json.Marshal(row)
+			require.NoError(t, err)
+			checkReason(string(encoded))
+			result, err = registry.ExecuteTool(ctx, direct[0], json.RawMessage(`{"count":1}`))
+			require.NoError(t, err)
+			require.False(t, result.Success)
+			require.Equal(t, tc.status, result.Data["status"])
+
+			refreshErr = nil
+			for _, live := range []bool{true, false} {
+				args := map[string]any{"mode": "list_tools", "server_id": "server-1", "refresh": live}
+				page := discoverPage(ctx, t, registry, args)
+				require.Equal(t, "ready", page.Status)
+				require.Len(t, page.Tools, 1)
+				require.Equal(t, "tool_000", page.Tools[0].Name)
+			}
+		})
+	}
+}
+
+func TestMCPCatalogRetainsRefreshFailureAfterLookupRecovers(t *testing.T) {
+	ctx, registry, catalog, _, _ := catalogFixture(t, 0)
+	service := catalog.servers["server-1"].service
+	var lookupErr error
+	catalog.lookup = func(context.Context, uint64, string) (*types.MCPService, error) {
+		if lookupErr != nil {
+			return nil, lookupErr
+		}
+		return service, nil
+	}
+	liveCalls := 0
+	catalog.load = func(_ context.Context, _ *types.MCPService, live bool) ([]*MCPTool, error) {
+		if live {
+			liveCalls++
+			return nil, fmt.Errorf("private-diagnostic: %w", context.DeadlineExceeded)
+		}
+		return nil, errMCPDirectoryStale
+	}
+	list := json.RawMessage(`{"mode":"list_tools","server_id":"server-1"}`)
+	refresh := json.RawMessage(`{"mode":"list_tools","server_id":"server-1","refresh":true}`)
+	failure := func(args json.RawMessage, status string) string {
+		t.Helper()
+		result, err := registry.ExecuteTool(ctx, ToolDiscoverMCPTools, args)
+		require.NoError(t, err)
+		require.False(t, result.Success)
+		require.Empty(t, result.Output)
+		require.Equal(t, status, result.Data["status"])
+		require.NotContains(t, result.Error, "private-diagnostic")
+		return result.Error
+	}
+	interruptLookup := func() {
+		t.Helper()
+		lookupErr = errors.New("private-diagnostic: repository unavailable")
+		failure(list, "unavailable")
+		page := discoverPage(ctx, t, registry, map[string]any{"mode": "list_servers"})
+		require.NotEmpty(t, page.Servers)
+		row := page.Servers[0]
+		require.Equal(t, service.ID, row.ServerID)
+		require.Equal(t, "unavailable", row.Status)
+		require.Empty(t, row.LastRefreshError)
+		require.Empty(t, row.NextStep)
+		lookupErr = nil
+	}
+	failure(list, "stale")
+	interruptLookup()
+	timeout := failure(refresh, "error")
+	require.Contains(t, timeout, "timed out")
+	require.Equal(t, timeout, failure(list, "error"))
+
+	interruptLookup()
+	require.Equal(t, timeout, failure(list, "error"))
+	require.Equal(t, 1, liveCalls)
 }
 
 func TestMCPCatalogRevalidatesServiceConfiguration(t *testing.T) {

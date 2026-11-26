@@ -69,6 +69,8 @@ const TM_KEY_PATTERNS = [
 ] as const
 
 const EXTRA_PREFIXES = [
+  // McpToolResult looks up service status codes supplied by the backend.
+  'agentStream.mcp.status.',
   // Operation labels use IDs supplied by the backend catalog at runtime.
   'agentStream.operations.names.',
   'system.globalSettings.listConfirm.',

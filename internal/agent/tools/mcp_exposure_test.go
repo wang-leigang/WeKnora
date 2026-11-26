@@ -370,8 +370,8 @@ func TestMCPExposureRestorePreservesUncalledDefinitionsAndCurrentPolicy(t *testi
 	)
 	require.NoError(t, err)
 	require.True(t, described.Success)
-	refs := original.MCPExposureSnapshot()
-	require.Len(t, refs, 1)
+	state := original.MCPRunState()
+	require.Len(t, state.ToolRefs, 1)
 	for _, mode := range []string{"same", "disabled", "changed-schema"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, r, c, gate, _ := catalogFixture(t, 1)
@@ -386,13 +386,90 @@ func TestMCPExposureRestorePreservesUncalledDefinitionsAndCurrentPolicy(t *testi
 				)
 			}
 			r.mcpPrepared = true
-			r.RestoreMCPExposure(refs)
+			r.RestoreMCPRunState(ctx, state)
 			r.RefreshMCPTools(ctx)
 			if mode == "same" {
 				require.Len(t, MCPToolNamesByServiceID(r)["server-1"], 1)
-				require.Equal(t, refs, r.MCPExposureSnapshot())
+				require.Equal(t, state.ToolRefs, r.MCPRunState().ToolRefs)
 			} else {
 				require.Empty(t, MCPToolNamesByServiceID(r)["server-1"])
+			}
+		})
+	}
+}
+
+func TestMCPRefreshFailureRestoreDuringPreload(t *testing.T) {
+	ctx := catalogTestContext()
+	service := types.MCPService{
+		ID: "orders", Name: "Orders", Enabled: true,
+		Headers: types.MCPHeaders{"Authorization": "private-test-credential"},
+	}
+	newRegistry := func(
+		ctx context.Context, service *types.MCPService, load mcpCatalogLoader,
+	) (*ToolRegistry, *MCPCatalog) {
+		catalog := newMCPCatalog(ctx, []*types.MCPService{service}, nil, load, nil)
+		registry := NewToolRegistry()
+		installMCPCatalog(registry, catalog)
+		return registry, catalog
+	}
+	timeout := func(context.Context, *types.MCPService, bool) ([]*MCPTool, error) {
+		return nil, fmt.Errorf("private-diagnostic: %w", context.DeadlineExceeded)
+	}
+	original, originalCatalog := newRegistry(ctx, &service, timeout)
+	_, _, err := originalCatalog.snapshot(ctx, service.ID, true)
+	require.Error(t, err)
+	data, err := json.Marshal(original.MCPRunState())
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "private-")
+	require.Contains(t, string(data), "timeout")
+	var saved MCPRunState
+	require.NoError(t, json.Unmarshal(data, &saved))
+
+	for _, tc := range []struct {
+		name, status string
+	}{
+		{"same", "error"},
+		{"edited documentation", "error"},
+		{"fresh directory", "ready"},
+		{"changed credential", "stale"},
+		{"changed timeout", "stale"},
+		{"other principal", "stale"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			current, currentCtx := service, ctx
+			switch tc.name {
+			case "edited documentation":
+				current.UsageInstructions = "updated"
+			case "changed credential":
+				current.Headers = types.MCPHeaders{"Authorization": "changed"}
+			case "changed timeout":
+				current.AdvancedConfig = &types.MCPAdvancedConfig{Timeout: 99}
+			case "other principal":
+				currentCtx = types.WithPrincipal(ctx, types.Principal{Type: types.PrincipalWebUser, ID: "another"})
+			}
+			started, release := make(chan struct{}), make(chan struct{})
+			load := func(context.Context, *types.MCPService, bool) ([]*MCPTool, error) {
+				close(started)
+				<-release
+				if tc.name == "fresh directory" {
+					return nil, nil
+				}
+				return nil, errMCPDirectoryStale
+			}
+			registry, catalog := newRegistry(currentCtx, &current, load)
+			registry.prepareMCPToolsWithMode(currentCtx, 0, false)
+			<-started
+			registry.RestoreMCPRunState(currentCtx, saved)
+			close(release)
+			<-catalog.preloadDone
+			row := catalog.servers[service.ID].summary(service.ID)
+			require.Equal(t, tc.status, row.Status)
+			if tc.status == "error" {
+				require.Contains(t, row.LastRefreshError, "timed out")
+				require.Equal(t, saved, registry.MCPRunState())
+			} else {
+				require.Empty(t, row.LastRefreshError)
+				require.Empty(t, registry.MCPRunState().RefreshFailures)
 			}
 		})
 	}

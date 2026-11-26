@@ -108,7 +108,7 @@ func (e *AgentEngine) Resume(
 	e.replayCollaborationDeliveries(&messages, len(state.RoundSteps), false)
 	appendBackground(p.Step)
 	if e.toolRegistry != nil {
-		e.toolRegistry.RestoreMCPExposure(snap.MCPToolRefs)
+		e.toolRegistry.RestoreMCPRunState(ctx, snap.MCPRunState)
 		e.toolRegistry.RememberMCPHistory(messages)
 		// These calls were issued before suspension, including the first call
 		// to a tool whose definition was only exposed by a describe round.

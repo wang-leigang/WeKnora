@@ -1605,6 +1605,7 @@ export default {
         not_loaded: '未読み込み',
         loading: '読み込み中',
         ready: '利用可能',
+        stale: 'ツール一覧の更新が必要',
         needs_auth: '認証が必要',
         error: '接続失敗',
         disabled: '無効',
